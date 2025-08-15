@@ -20,11 +20,17 @@ app.use(morgan('dev'));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } });
 
 const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin: (origin, cb) => cb(null, !origin || corsOrigins.length === 0 || corsOrigins.some(o => origin.includes(o))), methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'], credentials: false }));
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || corsOrigins.length === 0 || corsOrigins.some(o => origin.includes(o))),
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false
+}));
 
 const PORT = process.env.PORT || 3001;
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || '';
 const TIMEZONE = process.env.TIMEZONE || 'America/Chicago';
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 
 if (!MONGO_URI) {
   console.warn('⚠️ MONGO_URI is not set. API will start but DB calls will fail.');
@@ -88,6 +94,48 @@ function isCtNowWithinWindow(startHHmm, endHHmm) {
   }
   // window crosses midnight
   return now >= startHHmm || now < endHHmm;
+}
+
+// External API helpers (Instagram Graph, YouTube Data)
+async function fetchInstagramFollowers(settings) {
+  try {
+    const token = settings.instagramToken;
+    const igId = settings.igBusinessId;
+    if (!token || !igId) return { followers: 0, connected: false };
+    const url = `https://graph.facebook.com/v20.0/${encodeURIComponent(igId)}?fields=followers_count&access_token=${encodeURIComponent(token)}`;
+    const res = await fetch(url);
+    if (!res.ok) return { followers: 0, connected: false };
+    const j = await res.json();
+    const followers = Number(j?.followers_count || 0);
+    return { followers, connected: Number.isFinite(followers) && followers > 0 };
+  } catch {
+    return { followers: 0, connected: false };
+  }
+}
+
+async function fetchYouTubeStats(settings) {
+  try {
+    const channelId = settings.youtubeChannelId;
+    const accessToken = settings.youtubeAccessToken;
+    if (!channelId && !YOUTUBE_API_KEY) return { subscribers: 0, views: 0, watchTimeHours: 0, connected: false };
+    let url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(channelId || '')}`;
+    const headers = {};
+    if (accessToken) {
+      headers['Authorization'] = `Bearer ${accessToken}`;
+    } else if (YOUTUBE_API_KEY) {
+      url += `&key=${encodeURIComponent(YOUTUBE_API_KEY)}`;
+    }
+    const res = await fetch(url, { headers });
+    if (!res.ok) return { subscribers: 0, views: 0, watchTimeHours: 0, connected: false };
+    const j = await res.json();
+    const stats = j?.items?.[0]?.statistics || {};
+    const subscribers = Number(stats?.subscriberCount || 0);
+    const views = Number(stats?.viewCount || 0);
+    // watchTimeHours not directly available without reports API; omit or 0
+    return { subscribers, views, watchTimeHours: 0, connected: Number.isFinite(subscribers) };
+  } catch {
+    return { subscribers: 0, views: 0, watchTimeHours: 0, connected: false };
+  }
 }
 
 async function getLastNPosted(platform, n) {
@@ -386,13 +434,39 @@ app.get('/api/heatmap/optimal-times', async (req, res) => {
 
 // Analytics
 app.get('/api/analytics', async (req, res) => {
-  res.json({ instagram: { followers: 0, engagementRate: 0, reach: 0, connected: false }, youtube: { subscribers: 0, views: 0, watchTimeHours: 0, connected: false }, timeseries: { labels: [], instagram: [], youtube: [], combined: [] }, credentials: {} });
+  try {
+    const s = await getOrCreateSettings();
+    const [ig, yt] = await Promise.all([
+      fetchInstagramFollowers(s),
+      fetchYouTubeStats(s)
+    ]);
+    res.json({
+      instagram: { followers: ig.followers, engagementRate: 0, reach: 0, connected: ig.connected, autopilotEnabled: !!s.autopilotEnabled },
+      youtube: { subscribers: yt.subscribers, views: yt.views, watchTimeHours: yt.watchTimeHours, connected: yt.connected, autopilotEnabled: !!s.autopilotEnabled },
+      timeseries: { labels: [], instagram: [], youtube: [], combined: [] },
+      credentials: {}
+    });
+  } catch (e) {
+    res.json({ instagram: { followers: 0, engagementRate: 0, reach: 0, connected: false }, youtube: { subscribers: 0, views: 0, watchTimeHours: 0, connected: false }, timeseries: { labels: [], instagram: [], youtube: [], combined: [] }, credentials: {} });
+  }
 });
 app.get('/api/instagram/analytics', async (req, res) => {
-  res.json({ analytics: { followers: 0, engagementRate: 0, reach: 0, connected: false } });
+  try {
+    const s = await getOrCreateSettings();
+    const ig = await fetchInstagramFollowers(s);
+    res.json({ analytics: { followers: ig.followers, engagementRate: 0, reach: 0, connected: ig.connected } });
+  } catch {
+    res.json({ analytics: { followers: 0, engagementRate: 0, reach: 0, connected: false } });
+  }
 });
 app.get('/api/youtube/analytics', async (req, res) => {
-  res.json({ analytics: { subscribers: 0, views: 0, watchTimeHours: 0, connected: false } });
+  try {
+    const s = await getOrCreateSettings();
+    const yt = await fetchYouTubeStats(s);
+    res.json({ analytics: { subscribers: yt.subscribers, views: yt.views, watchTimeHours: yt.watchTimeHours, connected: yt.connected } });
+  } catch {
+    res.json({ analytics: { subscribers: 0, views: 0, watchTimeHours: 0, connected: false } });
+  }
 });
 
 // Scheduler status
