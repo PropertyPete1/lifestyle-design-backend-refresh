@@ -1,0 +1,36 @@
+{
+  "name": "lifestyle-design-backend-refresh",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Clean Node.js backend (Express + Mongoose) with last-N recent posts dedupe, Burst Mode, and endpoints for Lifestyle Design frontend.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_ENV=development nodemon src/server.js",
+    "start": "node src/server.js",
+    "lint": "eslint .",
+    "format": "prettier -w ."
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.6.3",
+    "morgan": "^1.10.0",
+    "pino": "^9.3.2",
+    "pino-http": "^9.0.0",
+    "string-similarity": "^4.0.4"
+  },
+  "devDependencies": {
+    "eslint": "^9.10.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.30.0",
+    "nodemon": "^3.1.4",
+    "prettier": "^3.3.3"
+  }
+}
+
+

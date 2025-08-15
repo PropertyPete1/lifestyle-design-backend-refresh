@@ -1,0 +1,121 @@
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+
+dotenv.config();
+
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+app.use(morgan('dev'));
+
+const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: (origin, cb) => cb(null, !origin || corsOrigins.length === 0 || corsOrigins.some(o => origin.includes(o))), credentials: true }));
+
+const PORT = process.env.PORT || 3001;
+const MONGO_URI = process.env.MONGO_URI || '';
+
+if (!MONGO_URI) {
+  console.warn('⚠️ MONGO_URI is not set. API will start but DB calls will fail.');
+}
+
+await mongoose.connect(MONGO_URI).catch(err => console.error('Mongo connect error:', err.message));
+
+// Health route (always responds)
+app.get('/api/scheduler/health', (req, res) => {
+  res.json({ ok: true, lastTickAt: null, lastRunDurationMs: null, lockHeld: false, lastRefillAt: null, lastRefillAdded: 0 });
+});
+
+// Minimal placeholders for required endpoints to satisfy frontend wiring (implementation to be expanded)
+app.get('/api/settings', (req, res) => {
+  res.json({
+    autopilotEnabled: false,
+    timeZone: 'America/Chicago',
+    dailyLimit: 5,
+    hourlyLimit: 3,
+    postTime: '14:00',
+    peakHours: true,
+    maxPosts: 5,
+    minimumIGLikesToRepost: 0,
+    recentPostsWindowCount: 30,
+    autopilotPlatforms: { instagram: true, youtube: true },
+  });
+});
+
+app.post('/api/settings', (req, res) => {
+  res.json({ success: true });
+});
+
+app.get('/api/autopilot/status', (req, res) => {
+  res.json({ success: true, autopilotEnabled: false, queueCount: 0, todayPosts: { instagram: 0, youtube: 0 }, caps: { hourlyLimit: 3, dailyLimit: 5 }, burst: { enabled: false, startTime: '00:00', endTime: '00:00', postsPerHour: 0, maxTotal: 0 } });
+});
+
+app.get('/api/autopilot/queue', (req, res) => {
+  res.json({ success: true, queue: [] });
+});
+
+app.post('/api/autopilot/run', (req, res) => {
+  res.json({ success: true, scheduled: 0, skipped: 0, checked: 0 });
+});
+
+app.post('/api/autopilot/refill', (req, res) => {
+  res.json({ success: true, added: 0, scheduledCount: 0, threshold: 3 });
+});
+
+app.get('/api/heatmap/weekly', (req, res) => {
+  const matrix = Array.from({ length: 7 }, () => Array.from({ length: 24 }, () => 0));
+  res.json({ matrix, meta: { scale: { min: 0, max: 100 }, generatedAt: new Date().toISOString(), method: 'weighted', weights: { viewerActivity: 0.6, postPerformance: 0.4 } }, topSlots: [] });
+});
+
+app.get('/api/heatmap/optimal-times', (req, res) => {
+  res.json({ slots: [] });
+});
+
+app.get('/api/analytics', (req, res) => {
+  res.json({ instagram: {}, youtube: {}, timeseries: { labels: [], instagram: [], youtube: [], combined: [] } });
+});
+
+app.get('/api/scheduler/status', (req, res) => {
+  res.json({ instagram: { used: 0, limit: 3 }, youtube: { used: 0, limit: 3 }, nextRun: null });
+});
+
+app.get('/api/diag/autopilot-report', (req, res) => {
+  res.json({ settings: { autopilotEnabled: false, dailyLimit: 5, hourlyLimit: 3, timeZone: 'America/Chicago', recentPostsWindowCount: 30 }, scheduler: { running: true, lastTickIso: null, tickEverySec: 60, activeLocks: [] }, queue: { total: 0, dueNow: 0, postingNow: 0, last10: [] }, postsLastHour: { count: 0, byPlatform: {} }, countersToday: { instagram: 0, youtube: 0, total: 0 }, locks: { schedulerLock: false, postOnceLocks: 0 } });
+});
+
+app.post('/api/diag/reset-counters', (req, res) => {
+  res.json({ ok: true, reset: 'today', note: 'no-op demo' });
+});
+
+app.get('/api/burst', (req, res) => {
+  res.json({ enabled: false, startTime: '00:00', endTime: '00:00', postsPerHour: 0, maxTotal: 0, platforms: ['instagram','youtube'], preloadMinutes: 10, scrapeLimit: 100, lastWindowISO: null, isActiveNow: false });
+});
+
+app.post('/api/burst', (req, res) => { res.json({ success: true }); });
+app.post('/api/burst/config', (req, res) => { res.json({ success: true }); });
+
+app.get('/api/activity/feed', (req, res) => {
+  res.json({ data: [] });
+});
+
+app.post('/api/post-now', (req, res) => {
+  res.json({ success: true, posted: 0, skipped: 0 });
+});
+
+app.post('/api/debug/similarity-check', (req, res) => {
+  res.json({ candidate: { visualHash: null, captionNorm: null, durationSec: null }, recentSample: [], decision: { duplicate: false, reason: 'no-sample' }, windowType: 'lastN', windowN: 30 });
+});
+
+app.post('/api/upload/dragdrop', (req, res) => {
+  res.json({ success: true, results: { uploaded: 0, duplicates: 0, details: [] } });
+});
+
+app.post('/api/upload/dropbox', (req, res) => { res.json({ success: true, message: 'queued 0' }); });
+app.post('/api/upload/google-drive', (req, res) => { res.json({ success: true, message: 'queued 0' }); });
+app.post('/api/test/cleanup', (req, res) => { res.json({ results: { filesRemoved: 0 } }); });
+app.post('/api/test/validate-apis', (req, res) => { res.json({ summary: { valid: 0, total: 0 } }); });
+app.post('/api/test/mongodb', (req, res) => { res.json({ message: MONGO_URI ? 'MongoDB configured' : 'No MongoDB configured' }); });
+app.post('/api/test/upload', (req, res) => { res.json({ message: 'Upload test ok' }); });
+
+app.listen(PORT, () => console.log(`Backend refresh listening on ${PORT}`));
