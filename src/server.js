@@ -245,96 +245,100 @@ app.get('/api/scheduler/health', async (req, res) => {
   res.json({ ok: true, ...schedulerState });
 });
 
-// Settings
+// GET /api/settings
 app.get('/api/settings', async (req, res) => {
   const s = await getOrCreateSettings();
-  const cred = {
-    'Instagram Token': s.instagramToken ? '✅ Configured' : '❌ Missing',
-    'IG Business ID': s.igBusinessId ? '✅ Configured' : '❌ Missing',
-    'Facebook Page': s.facebookPageId ? '✅ Configured' : '❌ Missing',
-    'YouTube Client ID': s.youtubeClientId ? '✅ Configured' : '❌ Missing',
-    'YouTube Client Secret': s.youtubeClientSecret ? '✅ Configured' : '❌ Missing',
-    'YouTube Access Token': s.youtubeAccessToken ? '✅ Configured' : '❌ Missing',
-    'YouTube Refresh Token': s.youtubeRefreshToken ? '✅ Configured' : '❌ Missing',
-    'YouTube Channel ID': s.youtubeChannelId ? '✅ Configured' : '❌ Missing',
-    'OpenAI API Key': s.openaiApiKey ? '✅ Configured' : '❌ Missing',
-    'S3 Access Key': s.s3AccessKey ? '✅ Configured' : '❌ Missing',
-    'S3 Secret Key': s.s3SecretKey ? '✅ Configured' : '❌ Missing',
-    'S3 Bucket Name': s.s3BucketName ? '✅ Configured' : '❌ Missing',
-    'S3 Region': s.s3Region ? '✅ Configured' : '❌ Missing',
-    'MongoDB URI': s.mongoURI ? '✅ Configured' : '❌ Missing',
-    'Dropbox Token': s.dropboxToken ? '✅ Configured' : '❌ Missing',
-    'Runway API Key': s.runwayApiKey ? '✅ Configured' : '❌ Missing'
-  };
+  const mask = (v) => (v ? '✅ Configured' : '❌ Missing');
   res.json({
     autopilotEnabled: s.autopilotEnabled,
     manual: s.manual,
-    timeZone: s.timeZone,
-    dailyLimit: s.dailyLimit,
-    hourlyLimit: s.hourlyLimit,
     postTime: s.postTime,
     peakHours: s.peakHours,
     maxPosts: s.maxPosts ?? s.dailyLimit,
-    repostDelay: s.repostDelay ?? 1,
     minimumIGLikesToRepost: s.minimumIGLikesToRepost,
-    recentPostsToCheck: s.recentPostsWindowCount, // mirror as requested by UI
-    visualSimilarityRecentPosts: s.visualSimilarityRecentPosts ?? s.recentPostsWindowCount,
+    recentPostsToCheck: s.recentPostsToCheck ?? s.recentPostsWindowCount,
+    hourlyLimit: s.hourlyLimit,
+    dailyLimit: s.dailyLimit,
     autopilotPlatforms: s.autopilotPlatforms,
     trendingAudio: s.trendingAudio,
     aiCaptions: s.aiCaptions,
     dropboxSave: s.dropboxSave,
+    timeZone: s.timeZone,
     burstModeEnabled: s.burstModeEnabled,
     burstModeConfig: s.burstModeConfig,
-    scrapeLimit: s.scrapeLimit,
-    credentials: cred,
-    // also expose raw IDs the page reads directly if present
-    instagramToken: undefined,
-    igBusinessId: s.igBusinessId,
-    facebookPageId: s.facebookPageId,
-    youtubeAccessToken: undefined,
-    youtubeRefreshToken: undefined,
-    youtubeChannelId: s.youtubeChannelId,
-    youtubeClientId: s.youtubeClientId,
-    youtubeClientSecret: undefined,
-    dropboxToken: undefined,
-    mongoURI: undefined,
-    runwayApiKey: undefined,
-    openaiApiKey: undefined,
-    s3AccessKey: undefined,
-    s3SecretKey: undefined,
-    s3BucketName: s.s3BucketName,
-    s3Region: s.s3Region
+
+    instagramToken: mask(s.instagramToken),
+    igBusinessId: mask(s.igBusinessId),
+    facebookPageId: mask(s.facebookPageId),
+    youtubeAccessToken: mask(s.youtubeAccessToken),
+    youtubeRefreshToken: mask(s.youtubeRefreshToken),
+    youtubeChannelId: mask(s.youtubeChannelId),
+    youtubeClientId: mask(s.youtubeClientId),
+    youtubeClientSecret: mask(s.youtubeClientSecret),
+    dropboxToken: mask(s.dropboxToken),
+    runwayApiKey: mask(s.runwayApiKey),
+    openaiApiKey: mask(s.openaiApiKey),
+    s3AccessKey: mask(s.s3AccessKey),
+    s3SecretKey: mask(s.s3SecretKey),
+    s3BucketName: mask(s.s3BucketName),
+    s3Region: mask(s.s3Region),
+    mongoURI: mask(s.mongoURI)
   });
 });
 
+// POST /api/settings
 app.post('/api/settings', async (req, res) => {
-  console.log('[SETTINGS_SAVE]', Object.keys(req.body));
+  if (!MONGO_URI) return res.status(500).json({ success: false, error: 'Server DB not configured' });
   const s = await getOrCreateSettings();
-  const up = { ...req.body };
-  // map accepted aliases without renaming incoming keys in storage
-  if (typeof up.facebookPage === 'string' && !up.facebookPageId) up.facebookPageId = up.facebookPage;
-  // recent posts mapping
-  if (typeof up.recentPostsToCheck === 'number') {
-    up.recentPostsWindowCount = up.recentPostsToCheck;
-    up.visualSimilarityRecentPosts = up.recentPostsToCheck;
+
+  // Only accept exact keys; ignore others silently
+  const allowedKeys = new Set([
+    'instagramToken','igBusinessId','facebookPageId',
+    'youtubeAccessToken','youtubeRefreshToken','youtubeChannelId','youtubeClientId','youtubeClientSecret',
+    'dropboxToken','runwayApiKey','openaiApiKey','s3AccessKey','s3SecretKey','s3BucketName','s3Region','mongoURI',
+    'autopilotEnabled','manual','postTime','peakHours','maxPosts','minimumIGLikesToRepost','recentPostsToCheck','hourlyLimit','dailyLimit','autopilotPlatforms','trendingAudio','aiCaptions','dropboxSave','timeZone',
+    // legacy alias
+    'minViews'
+  ]);
+
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const update = {};
+  const updatedKeys = [];
+
+  // Map legacy alias
+  if (Object.prototype.hasOwnProperty.call(body, 'minViews') && !Object.prototype.hasOwnProperty.call(body, 'minimumIGLikesToRepost')) {
+    body.minimumIGLikesToRepost = body.minViews;
   }
-  if (typeof up.maxPosts === 'number') {
-    // keep dailyLimit in sync if provided via maxPosts
-    if (typeof up.dailyLimit !== 'number') up.dailyLimit = up.maxPosts;
+
+  // Coerce numerics only if present (and not blank)
+  const numericKeys = ['maxPosts','minimumIGLikesToRepost','recentPostsToCheck','hourlyLimit','dailyLimit'];
+
+  for (const [k, v] of Object.entries(body)) {
+    if (!allowedKeys.has(k)) continue;
+    if (v === '' || v === null || typeof v === 'undefined') continue; // do not overwrite with blank
+    let val = v;
+    if (numericKeys.includes(k)) {
+      const n = typeof v === 'string' ? parseInt(v, 10) : v;
+      if (!Number.isNaN(n)) val = n; else continue;
+    }
+    if (k === 'autopilotPlatforms' && typeof v === 'object' && v) {
+      val = { instagram: !!v.instagram, youtube: !!v.youtube };
+    }
+    update[k] = val;
+    updatedKeys.push(k);
   }
-  // ints only if provided
-  const intKeys = ['maxPosts','repostDelay','minViews','minimumIGLikesToRepost','hourlyLimit','dailyLimit','recentPostsToCheck','recentPostsWindowCount','visualSimilarityRecentPosts'];
-  for (const k of intKeys) if (k in up && typeof up[k] === 'string') up[k] = parseInt(up[k]);
-  // autopilot/manual coupling
-  if (typeof up.autopilotEnabled === 'boolean' && typeof up.manual !== 'boolean') {
-    up.manual = !up.autopilotEnabled;
+
+  // Couple manual when autopilotEnabled provided and manual not explicitly set
+  if (Object.prototype.hasOwnProperty.call(update, 'autopilotEnabled') && !Object.prototype.hasOwnProperty.call(body, 'manual')) {
+    update.manual = !update.autopilotEnabled;
+    if (!updatedKeys.includes('manual')) updatedKeys.push('manual');
   }
-  // ignore empty strings so we don't wipe secrets
-  for (const k of Object.keys(up)) {
-    if (typeof up[k] === 'string' && up[k].trim() === '') delete up[k];
+
+  if (updatedKeys.length > 0) {
+    await Settings.updateOne({ _id: s._id }, { $set: update });
   }
-  await Settings.updateOne({ _id: s._id }, { $set: up });
-  res.json({ success: true });
+
+  res.json({ success: true, saved: updatedKeys });
 });
 
 // Autopilot status
