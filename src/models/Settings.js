@@ -11,13 +11,19 @@ const BurstConfigSchema = new mongoose.Schema({
 
 const SettingsSchema = new mongoose.Schema({
   autopilotEnabled: { type: Boolean, default: false },
+  manual: { type: Boolean, default: true },
   dailyLimit: { type: Number, default: 5 },
   hourlyLimit: { type: Number, default: 3 },
   timeZone: { type: String, default: 'America/Chicago' },
   postTime: { type: String, default: '14:00' },
   peakHours: { type: Boolean, default: true },
+  // UI mirrors and additional fields
+  maxPosts: { type: Number, default: 3 },
+  repostDelay: { type: Number, default: 1 },
   minimumIGLikesToRepost: { type: Number, default: 700 },
   recentPostsWindowCount: { type: Number, default: 30 },
+  visualSimilarityRecentPosts: { type: Number, default: 30 },
+  visualSimilarityDays: { type: Number, default: 30 },
   autopilotPlatforms: { type: Object, default: { instagram: true, youtube: true } },
   trendingAudio: { type: Boolean, default: true },
   aiCaptions: { type: Boolean, default: true },

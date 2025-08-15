@@ -20,7 +20,7 @@ app.use(morgan('dev'));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1024 * 1024 * 1024 } });
 
 const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin: (origin, cb) => cb(null, !origin || corsOrigins.length === 0 || corsOrigins.some(o => origin.includes(o))), credentials: true }));
+app.use(cors({ origin: (origin, cb) => cb(null, !origin || corsOrigins.length === 0 || corsOrigins.some(o => origin.includes(o))), methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'], credentials: false }));
 
 const PORT = process.env.PORT || 3001;
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || '';
@@ -268,14 +268,17 @@ app.get('/api/settings', async (req, res) => {
   };
   res.json({
     autopilotEnabled: s.autopilotEnabled,
+    manual: s.manual,
     timeZone: s.timeZone,
     dailyLimit: s.dailyLimit,
     hourlyLimit: s.hourlyLimit,
     postTime: s.postTime,
     peakHours: s.peakHours,
-    maxPosts: s.dailyLimit,
+    maxPosts: s.maxPosts ?? s.dailyLimit,
+    repostDelay: s.repostDelay ?? 1,
     minimumIGLikesToRepost: s.minimumIGLikesToRepost,
-    recentPostsWindowCount: s.recentPostsWindowCount,
+    recentPostsToCheck: s.recentPostsWindowCount, // mirror as requested by UI
+    visualSimilarityRecentPosts: s.visualSimilarityRecentPosts ?? s.recentPostsWindowCount,
     autopilotPlatforms: s.autopilotPlatforms,
     trendingAudio: s.trendingAudio,
     aiCaptions: s.aiCaptions,
@@ -283,16 +286,50 @@ app.get('/api/settings', async (req, res) => {
     burstModeEnabled: s.burstModeEnabled,
     burstModeConfig: s.burstModeConfig,
     scrapeLimit: s.scrapeLimit,
-    credentials: cred
+    credentials: cred,
+    // also expose raw IDs the page reads directly if present
+    instagramToken: undefined,
+    igBusinessId: s.igBusinessId,
+    facebookPageId: s.facebookPageId,
+    youtubeAccessToken: undefined,
+    youtubeRefreshToken: undefined,
+    youtubeChannelId: s.youtubeChannelId,
+    youtubeClientId: s.youtubeClientId,
+    youtubeClientSecret: undefined,
+    dropboxToken: undefined,
+    mongoURI: undefined,
+    runwayApiKey: undefined,
+    openaiApiKey: undefined,
+    s3AccessKey: undefined,
+    s3SecretKey: undefined,
+    s3BucketName: s.s3BucketName,
+    s3Region: s.s3Region
   });
 });
 
 app.post('/api/settings', async (req, res) => {
+  console.log('[SETTINGS_SAVE]', Object.keys(req.body));
   const s = await getOrCreateSettings();
   const up = { ...req.body };
-  if (typeof up.recentPostsToCheck === 'number') up.recentPostsWindowCount = up.recentPostsToCheck;
-  delete up.recentPostsToCheck;
-  // Ignore empty credential strings
+  // map accepted aliases without renaming incoming keys in storage
+  if (typeof up.facebookPage === 'string' && !up.facebookPageId) up.facebookPageId = up.facebookPage;
+  // recent posts mapping
+  if (typeof up.recentPostsToCheck === 'number') {
+    up.recentPostsWindowCount = up.recentPostsToCheck;
+    up.visualSimilarityRecentPosts = up.recentPostsToCheck;
+  }
+  if (typeof up.maxPosts === 'number') {
+    // keep dailyLimit in sync if provided via maxPosts
+    if (typeof up.dailyLimit !== 'number') up.dailyLimit = up.maxPosts;
+  }
+  // ints only if provided
+  const intKeys = ['maxPosts','repostDelay','minViews','minimumIGLikesToRepost','hourlyLimit','dailyLimit','recentPostsToCheck','recentPostsWindowCount','visualSimilarityRecentPosts'];
+  for (const k of intKeys) if (k in up && typeof up[k] === 'string') up[k] = parseInt(up[k]);
+  // autopilot/manual coupling
+  if (typeof up.autopilotEnabled === 'boolean' && typeof up.manual !== 'boolean') {
+    up.manual = !up.autopilotEnabled;
+  }
+  // ignore empty strings so we don't wipe secrets
   for (const k of Object.keys(up)) {
     if (typeof up[k] === 'string' && up[k].trim() === '') delete up[k];
   }
