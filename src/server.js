@@ -148,6 +148,11 @@ app.post('/api/debug/similarity-check', (req, res) => {
   res.json({ candidate: { visualHash: null, captionNorm: null, durationSec: null }, recentSample: [], decision: { duplicate: false, reason: 'no-sample' }, windowType: 'lastN', windowN: 30 });
 });
 
+// Drag-drop upload (frontend expects hyphenated path)
+app.post('/api/upload/drag-drop', (req, res) => {
+  res.json({ success: true, results: { uploaded: 0, duplicates: 0, details: [] } });
+});
+// Legacy alias without hyphen
 app.post('/api/upload/dragdrop', (req, res) => {
   res.json({ success: true, results: { uploaded: 0, duplicates: 0, details: [] } });
 });
