@@ -71,6 +71,25 @@ function cosineSimFromTokens(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
+function ctNowHHmm() {
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+  } catch {
+    return new Intl.DateTimeFormat('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+  }
+}
+
+function isCtNowWithinWindow(startHHmm, endHHmm) {
+  if (!startHHmm || !endHHmm) return false;
+  const now = ctNowHHmm();
+  // Compare strings like "18:00" lexicographically since fixed HH:mm format
+  if (startHHmm <= endHHmm) {
+    return now >= startHHmm && now < endHHmm;
+  }
+  // window crosses midnight
+  return now >= startHHmm || now < endHHmm;
+}
+
 async function getLastNPosted(platform, n) {
   return PostedMemo.find({ platform }).sort({ postedAt: -1 }).limit(n).lean();
 }
@@ -78,7 +97,7 @@ async function getLastNPosted(platform, n) {
 async function isDuplicateCandidate(candidate, settings) {
   const windowN = settings.recentPostsWindowCount || 30;
   const recent = await getLastNPosted(candidate.platform, windowN);
-  const captionNorm = normalizeCaption(candidate.caption || '');
+  const captionNorm = normalizeCaption(candidate.caption || candidate.captionNorm || '');
   for (const item of recent) {
     const hamming = hammingDistanceHex(candidate.visualHash, item.visualHash);
     if (hamming <= 8) return { duplicate: true, reason: 'duplicate_visual' };
@@ -95,7 +114,6 @@ async function isDuplicateCandidate(candidate, settings) {
   await getOrCreateSettings();
   const count = await PostQueue.countDocuments();
   if (count === 0) {
-    const now = new Date();
     const igLikes = [1200, 900, 750, 450, 100, 50, 1400, 820];
     const docs = igLikes.map((likes, i) => ({
       platform: 'instagram',
@@ -114,9 +132,117 @@ async function isDuplicateCandidate(candidate, settings) {
   }
 })();
 
+// Scheduler state and helpers
+const schedulerState = {
+  lastTickAt: null,
+  lastRunDurationMs: null,
+  lockHeld: false,
+  lastRefillAt: null,
+  lastRefillAdded: 0
+};
+
+async function tryAcquireLock(key, ttlSec) {
+  const expiresAt = new Date(Date.now() + ttlSec * 1000);
+  try {
+    await PostingLock.create({ key, expiresAt });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function scheduleRefill(threshold = 3) {
+  const s = await getOrCreateSettings();
+  const scheduledCount = await PostQueue.countDocuments({ status: 'scheduled' });
+  let added = 0;
+  if (scheduledCount < threshold) {
+    const need = threshold - scheduledCount;
+    const candidates = await PostQueue.find({ status: 'queued' }).sort({ 'engagement.likes': -1 }).limit(100);
+    for (const cand of candidates) {
+      if (cand.platform === 'instagram' && (cand.engagement?.likes || 0) < s.minimumIGLikesToRepost) continue;
+      const dup = await isDuplicateCandidate(cand, s);
+      if (dup.duplicate) {
+        cand.status = 'skipped';
+        await cand.save();
+        await ActivityLog.create({ type: 'schedule', platform: cand.platform, status: 'warning', message: 'Skipped duplicate', data: { reason: dup.reason } });
+        continue;
+      }
+      cand.captionNorm = normalizeCaption(cand.caption || '');
+      cand.status = 'scheduled';
+      cand.scheduledAt = new Date(Date.now() + (added * 60 + 30) * 1000);
+      await cand.save();
+      added++;
+      pushEvent({ type: 'schedule', platform: cand.platform, message: 'Scheduled', meta: { id: cand._id, at: cand.scheduledAt } });
+      await ActivityLog.create({ type: 'schedule', platform: cand.platform, status: 'success', message: 'Scheduled', data: { id: cand._id } });
+      if (added >= need) break;
+    }
+  }
+  return { added, scheduledCount: await PostQueue.countDocuments({ status: 'scheduled' }), threshold };
+}
+
+async function postDueWithCaps() {
+  const s = await getOrCreateSettings();
+  const burstActive = s.burstModeEnabled && isCtNowWithinWindow(s.burstModeConfig?.startTime, s.burstModeConfig?.endTime);
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const perPlatformTotals = { instagram: 0, youtube: 0 };
+  // posted in the last hour per platform
+  perPlatformTotals.instagram = await PostQueue.countDocuments({ platform: 'instagram', status: 'posted', postedAt: { $gte: hourAgo } });
+  perPlatformTotals.youtube = await PostQueue.countDocuments({ platform: 'youtube', status: 'posted', postedAt: { $gte: hourAgo } });
+  const hourlyLimit = burstActive ? (s.burstModeConfig?.postsPerHour || s.hourlyLimit) : s.hourlyLimit;
+
+  const due = await PostQueue.find({ status: 'scheduled', scheduledAt: { $lte: new Date() } }).sort({ scheduledAt: 1 }).limit(50);
+  let posted = 0, skipped = 0;
+  for (const item of due) {
+    // enforce per-hour cap per platform
+    if (perPlatformTotals[item.platform] >= hourlyLimit) continue;
+    const lockOk = await tryAcquireLock(`post:${item._id}`, 120);
+    if (!lockOk) continue;
+    pushEvent({ type: 'claim', platform: item.platform, message: 'Claimed for posting', meta: { id: item._id } });
+    const dup = await isDuplicateCandidate(item, s);
+    if (dup.duplicate) {
+      item.status = 'skipped'; await item.save(); skipped++;
+      await ActivityLog.create({ type: 'post', platform: item.platform, status: 'warning', message: 'Skipped duplicate at post time', data: { id: item._id, reason: dup.reason } });
+      continue;
+    }
+    item.status = 'posted'; item.postedAt = new Date(); await item.save();
+    await PostedMemo.create({ platform: item.platform, postedAt: item.postedAt, visualHash: item.visualHash, captionNorm: item.captionNorm, durationSec: item.durationSec, audioKey: item.audioKey });
+    perPlatformTotals[item.platform] += 1;
+    posted++;
+    pushEvent({ type: 'post_success', platform: item.platform, message: 'Posted 1 item', meta: { id: item._id, postedAt: item.postedAt } });
+    await ActivityLog.create({ type: 'post', platform: item.platform, status: 'success', message: 'Posted', data: { id: item._id } });
+  }
+  return { posted, skipped };
+}
+
+function startScheduler() {
+  setInterval(async () => {
+    const start = Date.now();
+    const have = await tryAcquireLock('scheduler', 55);
+    schedulerState.lockHeld = have;
+    if (!have) {
+      schedulerState.lastTickAt = new Date().toISOString();
+      schedulerState.lastRunDurationMs = Date.now() - start;
+      return;
+    }
+    try {
+      const refill = await scheduleRefill(3);
+      schedulerState.lastRefillAt = new Date().toISOString();
+      schedulerState.lastRefillAdded = refill.added;
+      await postDueWithCaps();
+    } catch (e) {
+      await ActivityLog.create({ type: 'error', status: 'failed', message: 'Scheduler tick error', data: { error: String(e?.message || e) } });
+    } finally {
+      schedulerState.lastTickAt = new Date().toISOString();
+      schedulerState.lastRunDurationMs = Date.now() - start;
+    }
+  }, 60 * 1000);
+}
+
+startScheduler();
+
 // Health route (always responds)
 app.get('/api/scheduler/health', async (req, res) => {
-  res.json({ ok: true, lastTickAt: null, lastRunDurationMs: null, lockHeld: false, lastRefillAt: null, lastRefillAdded: 0 });
+  res.json({ ok: true, ...schedulerState });
 });
 
 // Settings
@@ -193,32 +319,14 @@ app.get('/api/autopilot/queue', async (req, res) => {
 
 // Refill: schedule items based on likes + dedupe
 app.post('/api/autopilot/refill', async (req, res) => {
-  const s = await getOrCreateSettings();
-  const threshold = 3;
-  const scheduledCount = await PostQueue.countDocuments({ status: 'scheduled' });
-  let added = 0;
-  if (scheduledCount < threshold) {
-    const need = threshold - scheduledCount;
-    const candidates = await PostQueue.find({ status: 'queued' }).sort({ 'engagement.likes': -1 }).limit(50);
-    for (const cand of candidates) {
-      if (cand.platform === 'instagram' && (cand.engagement?.likes || 0) < s.minimumIGLikesToRepost) continue;
-      const dup = await isDuplicateCandidate(cand, s);
-      if (dup.duplicate) {
-        cand.status = 'skipped';
-        await cand.save();
-        await ActivityLog.create({ type: 'schedule', platform: cand.platform, status: 'warning', message: 'Skipped duplicate', data: { reason: dup.reason } });
-        continue;
-      }
-      cand.captionNorm = normalizeCaption(cand.caption || '');
-      cand.status = 'scheduled';
-      cand.scheduledAt = new Date(Date.now() + (added * 60 + 30) * 1000); // stagger within next minutes
-      await cand.save();
-      added++;
-      await ActivityLog.create({ type: 'schedule', platform: cand.platform, status: 'success', message: 'Scheduled', data: { id: cand._id } });
-      if (added >= need) break;
-    }
-  }
-  res.json({ success: true, added, scheduledCount: await PostQueue.countDocuments({ status: 'scheduled' }), threshold });
+  const out = await scheduleRefill(3);
+  res.json({ success: true, ...out });
+});
+
+// New: run now (scrape/filter/schedule simplified to refill logic)
+app.post('/api/autopilot/run', async (req, res) => {
+  const out = await scheduleRefill(5);
+  res.json({ success: true, scheduled: out.added, skipped: 0, checked: out.added });
 });
 
 // Autofill optimal times (stubbed)
@@ -263,7 +371,7 @@ app.get('/api/diag/autopilot-report', async (req, res) => {
   const dueNow = await PostQueue.countDocuments({ status: 'scheduled', scheduledAt: { $lte: new Date() } });
   const postingNow = await PostQueue.countDocuments({ status: 'posting' });
   const last10 = await PostQueue.find().sort({ updatedAt: -1 }).limit(10).lean();
-  res.json({ settings: { autopilotEnabled: s.autopilotEnabled, dailyLimit: s.dailyLimit, hourlyLimit: s.hourlyLimit, timeZone: s.timeZone, recentPostsWindowCount: s.recentPostsWindowCount, burstModeEnabled: s.burstModeEnabled, burstModeConfig: s.burstModeConfig }, scheduler: { running: true, lastTickIso: null, tickEverySec: 60, activeLocks: [] }, queue: { total, dueNow, postingNow, last10 }, postsLastHour: { count: 0, byPlatform: {} }, countersToday: { instagram: 0, youtube: 0, total: 0 }, locks: { schedulerLock: false, postOnceLocks: 0 } });
+  res.json({ settings: { autopilotEnabled: s.autopilotEnabled, dailyLimit: s.dailyLimit, hourlyLimit: s.hourlyLimit, timeZone: s.timeZone, recentPostsWindowCount: s.recentPostsWindowCount, burstModeEnabled: s.burstModeEnabled, burstModeConfig: s.burstModeConfig }, scheduler: { running: true, lastTickIso: schedulerState.lastTickAt, tickEverySec: 60, activeLocks: schedulerState.lockHeld ? ['scheduler'] : [] }, queue: { total, dueNow, postingNow, last10 }, postsLastHour: { count: 0, byPlatform: {} }, countersToday: { instagram: 0, youtube: 0, total: 0 }, locks: { schedulerLock: schedulerState.lockHeld, postOnceLocks: 0 } });
 });
 app.post('/api/diag/reset-counters', async (req, res) => { res.json({ ok: true }); });
 
@@ -381,7 +489,15 @@ app.post('/api/upload/smart-video-analyze', upload.single('file'), async (req, r
   if (!req.file) return res.status(400).json({ success: false, error: 'file missing' });
   res.json({ success: true, durationSec: 0, visualHash: null, firstFrameUrl: null });
 });
-app.post('/api/upload/dropbox-folder', async (req, res) => { res.json({ success: true, added: 0, duplicates: 0 }); });
+app.post('/api/upload/dropbox-folder', async (req, res) => { 
+  // lightly queue one demo item to prove wiring
+  const platform = req.body?.platform || 'instagram';
+  const caption = req.body?.caption || 'Dropbox demo file';
+  const doc = await PostQueue.create({ platform, caption, captionNorm: normalizeCaption(caption), status: 'queued', s3Url: 's3://bucket/dropbox-demo.mp4', engagement: { likes: 1000 }, durationSec: 20, visualHash: 'db01' });
+  pushEvent({ type: 'queue_added', platform, message: 'Dropbox queued 1', meta: { id: doc._id } });
+  await ActivityLog.create({ type: 'upload', platform, status: 'success', message: 'Dropbox folder queued', data: { id: doc._id } });
+  res.json({ success: true, added: 1, duplicates: 0 });
+});
 app.post('/api/upload/smart-drive-sync', async (req, res) => { res.json({ success: true, added: 0, duplicates: 0 }); });
 app.post('/api/upload/sync-dropbox', async (req, res) => { res.json({ success: true, added: 0, duplicates: 0 }); });
 app.post('/api/upload/dropbox', async (req, res) => { res.json({ success: true, message: 'queued 0' }); });
